@@ -138,7 +138,7 @@ static HANDLE GetOrCreateTempFileFor(int job_id, const char* command_that_just_f
     temp_dir[MAX_PATH] = '\0';
 
     access    = GENERIC_WRITE | GENERIC_READ;
-    sharemode = FILE_SHARE_WRITE;
+    sharemode = FILE_SHARE_WRITE | FILE_SHARE_READ;
     disp      = CREATE_ALWAYS;
     flags     = FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE;
 
