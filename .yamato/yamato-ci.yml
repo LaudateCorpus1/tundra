@@ -39,7 +39,7 @@ windows:
   commands:
     - git submodule init
     - git submodule update
-    - bee.exe tundra2::win::master
+    - bee.exe tundra2::win::master -l
     - bee.exe tundra2-unittest-report::win::master
   artifacts:
     artifacts:
