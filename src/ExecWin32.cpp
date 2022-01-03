@@ -133,7 +133,7 @@ static HANDLE GetOrCreateTempFileFor(int job_id, const char *command_that_just_f
         char temp_dir[MAX_PATH + 1];
         DWORD access, sharemode, disp, flags;
 
-        _snprintf(temp_dir, MAX_PATH, "%stundra.%u.%d", s_TemporaryDir, s_TundraPid, job_id);
+        _snprintf(temp_dir, MAX_PATH, "%s/tundra.%u.%d", s_TemporaryDir, s_TundraPid, job_id);
         temp_dir[MAX_PATH] = '\0';
 
         access = GENERIC_WRITE | GENERIC_READ;
@@ -233,8 +233,11 @@ void ExecInit(void)
 {
     s_TundraPid = GetCurrentProcessId();
 
-    if (0 == GetTempPathA(sizeof(s_TemporaryDir), s_TemporaryDir))
-        CroakErrno("couldn't get temporary directory path");
+    if (0 == GetEnvironmentVariable("TUNDRA_WIN_TEMP_DIR", s_TemporaryDir, sizeof(s_TemporaryDir)))
+    {
+        if (0 == GetTempPathA(sizeof(s_TemporaryDir), s_TemporaryDir))
+            CroakErrno("couldn't get temporary directory path");
+    }
 
     MutexInit(&s_FdMutex);
 
