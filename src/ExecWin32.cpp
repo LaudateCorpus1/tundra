@@ -5,19 +5,6 @@
  * support so-called "response files" which are basically just the contents of
  * the command line, but written to a file. Tundra implements this via the
  * @RESPONSE handling.
- *
- * Also, rather than using the tty merging module that unix uses, this module
- * handles output merging via temporary files.  This removes the pipe
- * read/write deadlocks I've seen from time to time when using the TTY merging
- * code. Rather than losing my last sanity points on debugging win32 internals
- * I've opted for this much simpler approach.
- *
- * Instead of buffering stuff in memory via pipe babysitting, this new code
- * first passes the stdout handle straight down to the first process it spawns.
- * Subsequent child processes that are spawned when the TTY is busy instead get
- * to inherit a temporary file handle. Once the process completes, it will wait
- * to get the TTY and flush its temporary output file to the console. The
- * temporary is then deleted.
  */
 
 #include "Exec.hpp"
@@ -27,6 +14,7 @@
 #include "BuildQueue.hpp"
 #include "Atomic.hpp"
 #include "SignalHandler.hpp"
+#include "NodeResultPrinting.hpp"
 
 #include <algorithm>
 
@@ -41,181 +29,25 @@
 #include <VersionHelpers.h>
 #include <thread>
 
-
+#define PIPE_BUF_SIZE 4096
 
 static char s_TemporaryDir[MAX_PATH];
 static DWORD s_TundraPid;
 static Mutex s_FdMutex;
 
-//allocate one stdout and one stderr handle per job
-static HANDLE s_TempFiles[kMaxBuildThreads];
+#define CROAK(...) { PrintMessage(MessageStatusLevel::Warning, __VA_ARGS__); exit(1); }
 
-static void ShowProgramsKeepingPathOpen(const char *path)
+static void CopyOutputIntoBuffer(int job_id, const char *command_that_just_finished, OutputBufferData *outputBuffer, MemAllocHeap *heap, std::string &pipeBuf)
 {
-    const char *function;
-    DWORD error;
-
-    WCHAR pathWide[MAX_PATH];
-    if (!MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, path, -1, pathWide, ARRAY_SIZE(pathWide)))
-    {
-        function = "MultiByteToWideChar";
-        error = GetLastError();
-        PrintErrno();
-        goto exit;
-    }
-
-    DWORD dwSessionHandle;
-    WCHAR sessionKey[CCH_RM_SESSION_KEY + 1];
-    memset(sessionKey, 0, sizeof(sessionKey));
-    function = "RmStartSession";
-    error = RmStartSession(&dwSessionHandle, 0, sessionKey);
-    if (error)
-        goto exit;
-
-    const WCHAR *rgsFileNames[] = {pathWide};
-    function = "RmRegisterResources";
-    error = RmRegisterResources(dwSessionHandle, ARRAY_SIZE(rgsFileNames), rgsFileNames, 0, NULL, 0, NULL);
-    if (error)
-        goto endSession;
-
-    UINT nProcInfoNeeded;
-    RM_PROCESS_INFO rgAffectedApps[16];
-    UINT nProcInfo = ARRAY_SIZE(rgAffectedApps);
-    DWORD dwRebootReasons;
-    function = "RmGetList";
-    error = RmGetList(dwSessionHandle, &nProcInfoNeeded, &nProcInfo, rgAffectedApps, &dwRebootReasons);
-    if (error)
-        goto endSession;
-
-    fprintf(stderr, "tundra: found %u processes keeping the file \"%s\" open (showing %u).\n",
-            (unsigned int)nProcInfoNeeded, path, (unsigned int)nProcInfo);
-
-    for (UINT i = 0; i < nProcInfo; ++i)
-    {
-        fprintf(stderr, "- \"%ls\" (PID %u)\n",
-                (wchar_t *)rgAffectedApps[i].strAppName,
-                (unsigned int)rgAffectedApps[i].Process.dwProcessId);
-
-        HANDLE hProcess;
-        FILETIME creationTime, exitTime, kernelTime, userTime;
-        WCHAR exeName[MAX_PATH];
-        DWORD dwSize = ARRAY_SIZE(exeName);
-
-        hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, rgAffectedApps[i].Process.dwProcessId);
-        if (hProcess && GetProcessTimes(hProcess, &creationTime, &exitTime, &kernelTime, &userTime) && CompareFileTime(&rgAffectedApps[i].Process.ProcessStartTime, &creationTime) == 0 && QueryFullProcessImageNameW(hProcess, 0, exeName, &dwSize))
-        {
-            fprintf(stderr, "    %ls\n", exeName);
-        }
-        else
-        {
-            fputs("    could not determine process image path: ", stderr);
-            PrintErrno();
-        }
-
-        if (hProcess)
-            CloseHandle(hProcess);
-    }
-
-endSession:
-    RmEndSession(dwSessionHandle);
-
-exit:
-    if (error)
-        fprintf(stderr, "tundra: failed to list processes keeping file open (%s returned error %d).\n", function, error);
-}
-
-static HANDLE GetOrCreateTempFileFor(int job_id, const char *command_that_just_finished)
-{
-    HANDLE result = s_TempFiles[job_id];
-
-    if (!result)
-    {
-        char temp_dir[MAX_PATH + 1];
-        DWORD access, sharemode, disp, flags;
-
-        _snprintf(temp_dir, MAX_PATH, "%stundra.%u.%d", s_TemporaryDir, s_TundraPid, job_id);
-        temp_dir[MAX_PATH] = '\0';
-
-        access = GENERIC_WRITE | GENERIC_READ;
-        sharemode = FILE_SHARE_WRITE;
-        disp = CREATE_ALWAYS;
-        flags = FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE;
-
-        result = CreateFileA(temp_dir, access, sharemode, NULL, disp, flags, NULL);
-
-        if (INVALID_HANDLE_VALUE == result)
-        {
-            bool was_sharing_violation = GetLastError() == 0x00000020;
-            fprintf(stderr, "tundra: error: failed to create temporary file: %s\n", temp_dir);
-            PrintErrno();
-            if (command_that_just_finished)
-            {
-                fprintf(stderr, "The just completed command was:\n  %s\n", command_that_just_finished);
-                if (was_sharing_violation)
-                    fputs("Most likely, the build action spawned a lingering subprocess that is "
-                          "keeping stdout/stderr open. The build action should either wait for "
-                          "such subprocesses to terminate before returning, or prevent them from "
-                          "inheriting its stdout/stderr handles to begin with.\n",
-                          stderr);
-            }
-            ShowProgramsKeepingPathOpen(temp_dir);
-
-            if (!command_that_just_finished || !was_sharing_violation)
-                exit(1);
-
-            fputs("tundra: waiting for subprocesses to exit, and for the file to be deleted...\n", stderr);
-            fflush(stderr);
-            do
-            {
-                Sleep(1000);
-                result = CreateFileA(temp_dir, access, sharemode, NULL, disp, flags, NULL);
-            } while (result == INVALID_HANDLE_VALUE);
-        }
-
-        SetHandleInformation(result, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-
-        s_TempFiles[job_id] = result;
-    }
-
-    return result;
-}
-
-static void CopyTempFileContentsIntoBufferAndPrepareFileForReuse(int job_id, const char *command_that_just_finished, OutputBufferData *outputBuffer, MemAllocHeap *heap)
-{
-    HANDLE tempFile = s_TempFiles[job_id];
-
-    //get the filesize
-    DWORD fsize = SetFilePointer(tempFile, 0, NULL, FILE_CURRENT);
-
-    // Rewind file position of the temporary file.
-    SetFilePointer(tempFile, 0, NULL, FILE_BEGIN);
-
     assert(outputBuffer->buffer == nullptr);
     assert(outputBuffer->heap == nullptr);
-    outputBuffer->buffer = static_cast<char *>(HeapAllocate(heap, fsize + 1));
+    outputBuffer->buffer = static_cast<char *>(HeapAllocate(heap, pipeBuf.size() + 1));
+    strncpy(outputBuffer->buffer, pipeBuf.c_str(), pipeBuf.size() + 1);
     outputBuffer->heap = heap;
-    outputBuffer->cursor = 0;
-    outputBuffer->buffer_size = fsize;
+    outputBuffer->cursor = pipeBuf.size();
+    outputBuffer->buffer_size = pipeBuf.size();
 
-    DWORD processed = 0;
-    while (processed < fsize)
-    {
-        DWORD spaceRemaining = (DWORD)outputBuffer->buffer_size - outputBuffer->cursor;
-        DWORD amountRead = 0;
-        if (!ReadFile(tempFile, outputBuffer->buffer + outputBuffer->cursor, spaceRemaining, &amountRead, NULL) || amountRead == 0)
-            CroakErrnoAbort("ReadFile from temporary file failed before we read all of its data");
-        processed += amountRead;
-        outputBuffer->cursor += amountRead;
-    }
-    outputBuffer->buffer[outputBuffer->cursor] = 0;
-
-    // Close file (which should trigger its deletion).
-    if (!CloseHandle(tempFile))
-        CroakErrnoAbort("CloseHandle failed");
-    s_TempFiles[job_id] = 0;
-
-    // Immediately recreate the file. If a lingering process is keeping the file open, that is a bug, and we want to find out immediately.
-    GetOrCreateTempFileFor(job_id, command_that_just_finished);
+    outputBuffer->buffer[pipeBuf.size()] = 0;
 }
 
 static struct Win32EnvBinding
@@ -359,7 +191,7 @@ MakeEnvBlock(char *env_block, size_t block_size, const EnvVariable *env_vars, in
     return true;
 }
 
-static bool SetupResponseFile(const char *cmd_line, char *out_new_cmd_line, int new_cmdline_max_length, char *out_responsefile, int response_file_max_length)
+static bool SetupResponseFile(const char *cmd_line, char *out_new_cmd_line, int new_cmdline_max_length, char *out_responsefile, int response_file_max_length, uint32_t sequence_id)
 {
     static const char response_prefix[] = "@RESPONSE|";
     static const char response_suffix_char = '|';
@@ -410,10 +242,7 @@ static bool SetupResponseFile(const char *cmd_line, char *out_new_cmd_line, int 
             if ('\\' == tmp_dir[rc - 1])
                 tmp_dir[rc - 1] = '\0';
 
-            static uint32_t foo = 0;
-            uint32_t sequence = AtomicIncrement(&foo);
-
-            _snprintf(out_responsefile, response_file_max_length, "%s\\tundra.resp.%u.%u", tmp_dir, GetCurrentProcessId(), sequence);
+            _snprintf(out_responsefile, response_file_max_length, "%s\\tundra.resp.%u.%u", tmp_dir, s_TundraPid, sequence_id);
             out_responsefile[response_file_max_length] = '\0';
 
             {
@@ -488,36 +317,93 @@ static void CleanupResponseFile(const char *responseFile)
         remove(responseFile);
 }
 
-static int WaitForFinish(HANDLE processHandle, int (*callback_on_slow)(void *user_data), void *callback_on_slow_userdata, int time_until_first_callback, bool *out_wassignaled)
+static int WaitForChildExit(HANDLE child, int (*callback_on_slow)(void *user_data), void *callback_on_slow_userdata)
 {
-    HANDLE handles[2];
-    handles[0] = processHandle;
-    handles[1] = SignalGetHandle();
-    DWORD timeUntilNextSlowCallbackInvoke = callback_on_slow != nullptr ? time_until_first_callback : INFINITE;
+    DWORD waitResult;
+    DWORD exitCode;
 
-    while (true)
+    DWORD timeout = callback_on_slow == nullptr ? INFINITE : 1000;
+
+    for (;;)
     {
-        DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, timeUntilNextSlowCallbackInvoke * 1000);
-        DWORD result_code = 0;
+        waitResult = WaitForSingleObject(child, timeout);
         switch (waitResult)
         {
         case WAIT_OBJECT_0:
             // OK - command ran to completion.
-            GetExitCodeProcess(processHandle, &result_code);
-            *out_wassignaled = false;
-            return result_code;
-
-        case WAIT_OBJECT_0 + 1:
-            // We have been interrupted - kill the program.
-            WaitForSingleObject(processHandle, INFINITE);
-            // Leave result_code at 1 to indicate failed build.
-            *out_wassignaled = true;
-            return 1;
+            GetExitCodeProcess(child, &exitCode);
+            return exitCode;
 
         case WAIT_TIMEOUT:
-            timeUntilNextSlowCallbackInvoke = (*callback_on_slow)(callback_on_slow_userdata);
+            if (callback_on_slow != nullptr)
+                (*callback_on_slow)(callback_on_slow_userdata);
+            break;
+
+        default:
+            CROAK("unhandled WaitForSingleObject result: %d", waitResult);
         }
     }
+}
+
+static int WaitForFinish(HANDLE processHandle, int (*callback_on_slow)(void *user_data), void *callback_on_slow_userdata, int time_until_first_callback, std::string &pipeBuf, HANDLE childPipe)
+{
+    CHAR buf[PIPE_BUF_SIZE];
+    DWORD dwAvail;
+    DWORD lastError;
+
+    OVERLAPPED overlapped;
+    memset(&overlapped, 0, sizeof(overlapped));
+    if (!ReadFile(childPipe, buf, PIPE_BUF_SIZE, &dwAvail, &overlapped))
+    {
+        lastError = GetLastError();
+        if (lastError == ERROR_BROKEN_PIPE)
+            return WaitForChildExit(processHandle, callback_on_slow, callback_on_slow_userdata);
+
+        if (lastError != ERROR_IO_PENDING)
+            CROAK("ReadFile returned an unexpected error: %d", lastError);
+    }
+
+    DWORD initialTimeout = callback_on_slow == nullptr ? INFINITE : time_until_first_callback;
+    DWORD subsequentTimeout = callback_on_slow == nullptr ? INFINITE : 1000;
+    DWORD timeout = initialTimeout;
+
+    for (;;)
+    {
+        if (!GetOverlappedResultEx(childPipe, &overlapped, &dwAvail, timeout, FALSE))
+        {
+            lastError = GetLastError();
+            if (lastError == ERROR_BROKEN_PIPE)
+                return WaitForChildExit(processHandle, callback_on_slow, callback_on_slow_userdata);
+
+            if (lastError == WAIT_TIMEOUT)
+            {
+                if (callback_on_slow != nullptr)
+                    (*callback_on_slow)(callback_on_slow_userdata);
+                continue;
+            }
+
+            CROAK("GetOverlappedResultEx failed: %d", lastError);
+        }
+        timeout = subsequentTimeout;
+
+        if (dwAvail > 0)
+            pipeBuf.append(buf, dwAvail);
+
+
+        // Start another async read.
+        memset(&overlapped, 0, sizeof(overlapped));
+        if (!ReadFile(childPipe, buf, PIPE_BUF_SIZE, &dwAvail, &overlapped))
+        {
+            lastError = GetLastError();
+            if (lastError == ERROR_BROKEN_PIPE)
+                return WaitForChildExit(processHandle, callback_on_slow, callback_on_slow_userdata);
+
+            if (lastError != ERROR_IO_PENDING)
+                CROAK("ReadFile returned an unexpected error: %d", lastError);
+        }
+    }
+
+    return WaitForChildExit(processHandle, callback_on_slow, callback_on_slow_userdata);
 }
 
 ExecResult ExecuteProcess(
@@ -531,6 +417,39 @@ ExecResult ExecuteProcess(
     void *callback_on_slow_userdata,
     int time_until_first_callback)
 {
+    static uint32_t seq = 0;
+    uint32_t sequence_id = AtomicIncrement(&seq);
+
+    char pipe_name[100];
+    snprintf(pipe_name, sizeof(pipe_name), "\\\\.\\pipe\\tundra.%u.%d.%u", s_TundraPid, job_id, sequence_id);
+
+    HANDLE pipe = CreateNamedPipeA(pipe_name,
+        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED, // Open mode.
+        PIPE_TYPE_BYTE,                             // Pipe mode.
+        1,                                          // Max instances: we don't want other processes opening the pipe.
+        0,                                          // Output buffer size: unused with PIPE_ACCESS_INBOUND?
+        PIPE_BUF_SIZE,                              // Input buffer size.
+        INFINITE,                                   // Default timeout.
+        NULL);                                      // Security attributes.
+    if (pipe == INVALID_HANDLE_VALUE)
+        CROAK("CreateNamedPipeA failed: %d", GetLastError());
+
+    SECURITY_ATTRIBUTES saAttr;
+    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+    saAttr.bInheritHandle = TRUE;
+    saAttr.lpSecurityDescriptor = NULL;
+
+    // Get the write end of the pipe as a handle inheritable across processes.
+    HANDLE child_write_pipe = CreateFileA(pipe_name,
+        GENERIC_WRITE, // Desired access.
+        0,             // Share mode.
+        &saAttr,       // Security attributes which create an inheritable handle.
+        OPEN_EXISTING, // Creation disposition.
+        0,             // Flags and attributes.
+        NULL);         // Template file.
+    if (child_write_pipe == INVALID_HANDLE_VALUE)
+        CROAK("CreateFileA failed: %d", GetLastError());
+
     STARTUPINFOEXW sinfo;
     ZeroMemory(&sinfo, sizeof(STARTUPINFOEXW));
 
@@ -541,7 +460,7 @@ ExecResult ExecuteProcess(
     void *attributeListAllocation = nullptr;
     if (!stream_to_stdout)
     {
-        sinfo.StartupInfo.hStdOutput = sinfo.StartupInfo.hStdError = GetOrCreateTempFileFor(job_id, NULL);
+        sinfo.StartupInfo.hStdOutput = sinfo.StartupInfo.hStdError = child_write_pipe;
         sinfo.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
         sinfo.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
         creationFlags |= EXTENDED_STARTUPINFO_PRESENT;
@@ -589,7 +508,7 @@ ExecResult ExecuteProcess(
     ZeroMemory(&responseFile, sizeof(responseFile));
     ZeroMemory(&new_cmd, sizeof(new_cmd));
 
-    if (!SetupResponseFile(cmd_line, new_cmd, sizeof new_cmd, responseFile, sizeof responseFile))
+    if (!SetupResponseFile(cmd_line, new_cmd, sizeof new_cmd, responseFile, sizeof responseFile, sequence_id))
         return result;
 
     const char *cmd_to_use = new_cmd[0] == 0 ? cmd_line : new_cmd;
@@ -619,12 +538,20 @@ ExecResult ExecuteProcess(
     ResumeThread(pinfo.hThread);
     CloseHandle(pinfo.hThread);
 
-    result.m_ReturnCode = WaitForFinish(pinfo.hProcess, callback_on_slow, callback_on_slow_userdata, time_until_first_callback, &result.m_WasAborted);
+    //result.m_ReturnCode = WaitForFinish(pinfo.hProcess, callback_on_slow, callback_on_slow_userdata, time_until_first_callback, &result.m_WasAborted);
+    CloseHandle(child_write_pipe); // No longer needed now that the child has been created.
+
+    std::string pipeBuf;
+    result.m_ReturnCode = WaitForFinish(pinfo.hProcess,
+        callback_on_slow, callback_on_slow_userdata, time_until_first_callback,
+        pipeBuf, pipe);
+
+    CloseHandle(pipe);
 
     CleanupResponseFile(responseFile);
 
     if (!stream_to_stdout)
-        CopyTempFileContentsIntoBufferAndPrepareFileForReuse(job_id, buffer, &result.m_OutputBuffer, heap);
+        CopyOutputIntoBuffer(job_id, buffer, &result.m_OutputBuffer, heap, pipeBuf);
 
     CloseHandle(pinfo.hProcess);
     CloseHandle(job_object);
