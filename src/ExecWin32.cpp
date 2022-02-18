@@ -23,7 +23,6 @@
 #include "Exec.hpp"
 #include "Common.hpp"
 #include "Config.hpp"
-#include "Mutex.hpp"
 #include "BuildQueue.hpp"
 #include "Atomic.hpp"
 #include "SignalHandler.hpp"
@@ -45,7 +44,6 @@
 
 static char s_TemporaryDir[MAX_PATH];
 static DWORD s_TundraPid;
-static Mutex s_FdMutex;
 
 //allocate one stdout and one stderr handle per job
 static HANDLE s_TempFiles[kMaxBuildThreads];
@@ -235,8 +233,6 @@ void ExecInit(void)
 
     if (0 == GetTempPathA(sizeof(s_TemporaryDir), s_TemporaryDir))
         CroakErrno("couldn't get temporary directory path");
-
-    MutexInit(&s_FdMutex);
 
     // Initialize win32 env block. We're going to let it leak.
     // This block contains a series of nul-terminated strings, with a double nul
