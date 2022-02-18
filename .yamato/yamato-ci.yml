@@ -18,8 +18,8 @@ mac:
   name: "Build & Test - Mac"
   agent:
     type: Unity::VM::osx
-    image: buildfarm/mac:stable
-    flavor: m1.mac
+    image: build-system/unity-macos-10.13:v0.1-596544
+    flavor: b1.medium
   commands:
     - git submodule init
     - git submodule update
