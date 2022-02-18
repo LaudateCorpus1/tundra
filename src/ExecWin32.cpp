@@ -596,10 +596,6 @@ ExecResult ExecuteProcess(
     _snprintf(buffer, sizeof(buffer), "cmd.exe /c \"%s\"", cmd_to_use);
     buffer[sizeof(buffer) - 1] = '\0';
 
-    HANDLE job_object = CreateJobObject(NULL, NULL);
-    if (!job_object)
-        CroakErrno("Couldn't create job object.");
-
     WCHAR buffer_wide[sizeof(buffer) * 2];
     if (!MultiByteToWideChar(CP_UTF8, 0, buffer, (int)sizeof(buffer), buffer_wide, sizeof(buffer_wide) / sizeof(WCHAR)))
         CroakErrnoAbort("Failed converting buffer block to wide char");
@@ -615,7 +611,6 @@ ExecResult ExecuteProcess(
         HeapFree(heap, attributeListAllocation);
     }
 
-    AssignProcessToJobObject(job_object, pinfo.hProcess);
     ResumeThread(pinfo.hThread);
     CloseHandle(pinfo.hThread);
 
@@ -627,7 +622,6 @@ ExecResult ExecuteProcess(
         CopyTempFileContentsIntoBufferAndPrepareFileForReuse(job_id, buffer, &result.m_OutputBuffer, heap);
 
     CloseHandle(pinfo.hProcess);
-    CloseHandle(job_object);
 
     return result;
 }
