@@ -194,135 +194,6 @@ MakeEnvBlock(char *env_block, size_t block_size, const EnvVariable *env_vars, in
     return true;
 }
 
-static bool SetupResponseFile(const char *cmd_line, char *out_new_cmd_line, int new_cmdline_max_length, char *out_responsefile, int response_file_max_length, uint32_t sequence_id)
-{
-    static const char response_prefix[] = "@RESPONSE|";
-    static const char response_suffix_char = '|';
-    static const char always_response_prefix[] = "@RESPONSE!";
-    static const char always_response_suffix_char = '!';
-    static_assert(sizeof response_prefix == sizeof always_response_prefix, "Response prefix lengths differ");
-    static const size_t response_prefix_len = sizeof(response_prefix) - 1;
-    char command_buf[512];
-    char option_buf[32];
-    char response_suffix = response_suffix_char;
-    const char *response;
-
-    if (NULL == (response = strstr(cmd_line, response_prefix)))
-    {
-        if (NULL != (response = strstr(cmd_line, always_response_prefix)))
-        {
-            response_suffix = always_response_suffix_char;
-        }
-    }
-
-    /* scan for a @RESPONSE|<option>|.... section at the end of the command line */
-    if (NULL != response)
-    {
-        const size_t cmd_len = strlen(cmd_line);
-        const char *option, *option_end;
-
-        option = response + response_prefix_len;
-
-        if (NULL == (option_end = strchr(option, response_suffix)))
-        {
-            fprintf(stderr, "badly formatted @RESPONSE section; missing %c after option: %s\n", response_suffix, cmd_line);
-            return false;
-        }
-
-        /* Limit on XP and later is 8191 chars; but play it safe */
-        if (response_suffix == always_response_suffix_char || cmd_len > 8000)
-        {
-            char tmp_dir[MAX_PATH];
-            DWORD rc;
-
-            rc = GetTempPath(sizeof(tmp_dir), tmp_dir);
-            if (rc >= sizeof(tmp_dir) || 0 == rc)
-            {
-                fprintf(stderr, "couldn't get temporary directory for response file; win32 error=%d", (int)GetLastError());
-                return false;
-            }
-
-            if ('\\' == tmp_dir[rc - 1])
-                tmp_dir[rc - 1] = '\0';
-
-            static uint32_t foo = 0;
-            uint32_t sequence = AtomicIncrement(&foo);
-
-            _snprintf(out_responsefile, response_file_max_length, "%s\\tundra.resp.%u.%u", tmp_dir, s_TundraPid, sequence);
-            out_responsefile[response_file_max_length] = '\0';
-
-            {
-                HANDLE hf = CreateFileA(out_responsefile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (INVALID_HANDLE_VALUE == hf)
-                {
-                    fprintf(stderr, "couldn't create response file %s; @err=%u", out_responsefile, (unsigned int)GetLastError());
-                    return false;
-                }
-
-                DWORD written;
-                WriteFile(hf, option_end + 1, (DWORD)strlen(option_end + 1), &written, NULL);
-
-                if (!CloseHandle(hf))
-                {
-                    fprintf(stderr, "couldn't close response file %s: errno=%d", out_responsefile, errno);
-                    return false;
-                }
-                hf = NULL;
-            }
-
-            {
-                const int pre_suffix_len = (int)(response - cmd_line);
-                int copy_len = std::min(pre_suffix_len, (int)(sizeof(command_buf) - 1));
-                if (copy_len != pre_suffix_len)
-                {
-                    char truncated_cmd[sizeof(command_buf)];
-                    _snprintf(truncated_cmd, sizeof(truncated_cmd) - 1, "%s", cmd_line);
-                    truncated_cmd[sizeof(truncated_cmd) - 1] = '\0';
-
-                    fprintf(stderr, "Couldn't copy command (%s...) before response file suffix. "
-                                    "Move the response file suffix closer to the command starting position.\n",
-                            truncated_cmd);
-                    return false;
-                }
-                strncpy(command_buf, cmd_line, copy_len);
-                command_buf[copy_len] = '\0';
-                copy_len = std::min((int)(option_end - option), (int)(sizeof(option_buf) - 1));
-                strncpy(option_buf, option, copy_len);
-                option_buf[copy_len] = '\0';
-            }
-
-            _snprintf(out_new_cmd_line, new_cmdline_max_length, "%s %s%s", command_buf, option_buf, out_responsefile);
-            out_new_cmd_line[new_cmdline_max_length - 1] = '\0';
-        }
-        else
-        {
-            size_t i, len;
-            int copy_len = std::min((int)(response - cmd_line), (int)(sizeof(command_buf) - 1));
-            strncpy(command_buf, cmd_line, copy_len);
-            command_buf[copy_len] = '\0';
-            _snprintf(out_new_cmd_line, new_cmdline_max_length, "%s%s", command_buf, option_end + 1);
-            out_new_cmd_line[new_cmdline_max_length - 1] = '\0';
-
-            /* Drop any newlines in the command line. They are needed for response
-      * files only to make sure the max length doesn't exceed 128 kb */
-            for (i = 0, len = strlen(out_new_cmd_line); i < len; ++i)
-            {
-                if (out_new_cmd_line[i] == '\n')
-                {
-                    out_new_cmd_line[i] = ' ';
-                }
-            }
-        }
-    }
-    return true;
-}
-
-static void CleanupResponseFile(const char *responseFile)
-{
-    if (*responseFile != 0)
-        remove(responseFile);
-}
-
 static int WaitForChildExit(HANDLE processHandle, int (*callback_on_slow)(void *user_data), void *callback_on_slow_userdata)
 {
     DWORD waitResult;
@@ -511,13 +382,8 @@ ExecResult ExecuteProcess(
 
     ExecResult result;
     char new_cmd[8192];
-    char responseFile[MAX_PATH];
     ZeroMemory(&result, sizeof(ExecResult));
-    ZeroMemory(&responseFile, sizeof(responseFile));
     ZeroMemory(&new_cmd, sizeof(new_cmd));
-
-    if (!SetupResponseFile(cmd_line, new_cmd, sizeof new_cmd, responseFile, sizeof responseFile, sequence_id))
-        return result;
 
     const char *cmd_to_use = new_cmd[0] == 0 ? cmd_line : new_cmd;
     _snprintf(buffer, sizeof(buffer), "cmd.exe /c \"%s\"", cmd_to_use);
@@ -550,8 +416,6 @@ ExecResult ExecuteProcess(
         pipeBuf, pipe);
 
     CloseHandle(pipe);
-
-    CleanupResponseFile(responseFile);
 
     if (!stream_to_stdout)
         CopyOutputIntoBuffer(job_id, buffer, &result.m_OutputBuffer, heap, pipeBuf);
