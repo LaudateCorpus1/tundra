@@ -409,7 +409,7 @@ static bool SetupResponseFile(const char *cmd_line, char *out_new_cmd_line, int 
             static uint32_t foo = 0;
             uint32_t sequence = AtomicIncrement(&foo);
 
-            _snprintf(out_responsefile, response_file_max_length, "%s\\tundra.resp.%u.%u", tmp_dir, GetCurrentProcessId(), sequence);
+            _snprintf(out_responsefile, response_file_max_length, "%s\\tundra.resp.%u.%u", tmp_dir, s_TundraPid, sequence);
             out_responsefile[response_file_max_length] = '\0';
 
             {
